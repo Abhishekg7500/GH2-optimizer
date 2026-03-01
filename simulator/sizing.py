@@ -20,6 +20,10 @@ Algorithm:
   Then run storage sizing pass → find minimum storage for zero deficit
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 from simulator.dispatch import run_dispatch
 from economics.capex import calculate_capex
