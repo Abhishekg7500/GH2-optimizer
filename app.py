@@ -152,33 +152,49 @@ def run_dispatch(sp, wp, solar_mw, wind_mw, elec_mw,
                  min_flow, max_flow, stor_kg):
     N            = 8760
     min_load_mw  = stack_mw * min_load_pct
+    min_flow     = float(min_flow)
+    max_flow     = float(max_flow)
+    stor_kg      = float(stor_kg)
     stor_level   = stor_kg * 0.5
 
-    re_pw  = np.zeros(N); ep    = np.zeros(N)
-    h2_pr  = np.zeros(N); h2_dl = np.zeros(N)
-    h2_st  = np.zeros(N); curt  = np.zeros(N)
-    defic  = np.zeros(N)
+    re_pw   = np.zeros(N); ep     = np.zeros(N)
+    h2_pr   = np.zeros(N); h2_dl  = np.zeros(N)
+    h2_st   = np.zeros(N); curt   = np.zeros(N)
+    defic   = np.zeros(N); s_draw = np.zeros(N)
+    s_chrg  = np.zeros(N)
 
     for h in range(N):
-        re = sp[h]*solar_mw + wp[h]*wind_mw
+        re = float(sp[h]) * solar_mw + float(wp[h]) * wind_mw
         re_pw[h] = re
+
         if re >= min_load_mw:
-            p        = min(re, elec_mw)
-            ep[h]    = p
-            h2_pr[h] = p * 1000.0 / eff
-            curt[h]  = max(0.0, re - elec_mw)
+            p         = min(re, elec_mw)
+            ep[h]     = p
+            h2_pr[h]  = p * 1000.0 / eff
+            curt[h]   = max(0.0, re - elec_mw)
         else:
-            curt[h]  = re
+            curt[h]   = re
 
-        direct     = min(h2_pr[h], max_flow)
-        excess     = h2_pr[h] - direct
-        stor_level = min(stor_level + excess, stor_kg)
+        # Direct supply capped at max flow
+        direct = min(h2_pr[h], max_flow)
 
+        # Excess beyond max flow goes to storage
+        excess = h2_pr[h] - direct
+        if excess > 0:
+            space       = stor_kg - stor_level
+            charged     = min(excess, space)
+            stor_level += charged
+            s_chrg[h]   = charged
+
+        # If below min flow draw from storage
         if direct < min_flow:
-            draw       = min(min_flow - direct, stor_level)
-            direct    += draw
-            stor_level -= draw
+            shortfall   = min_flow - direct
+            draw        = min(shortfall, stor_level)
+            direct     += draw
+            stor_level  -= draw
+            s_draw[h]   = draw
 
+        # Record deficit if still below min flow after storage draw
         if direct < min_flow:
             defic[h] = min_flow - direct
 
@@ -188,15 +204,19 @@ def run_dispatch(sp, wp, solar_mw, wind_mw, elec_mw,
     sg = float(np.sum(sp * solar_mw))
     wg = float(np.sum(wp * wind_mw))
     rc = float(np.sum(ep))
+
     return {
-        "re_power": re_pw, "elec_power": ep,
-        "h2_produced": h2_pr, "h2_delivered": h2_dl,
-        "h2_storage": h2_st, "curtailment": curt, "deficit": defic,
+        "re_power":       re_pw,  "elec_power":   ep,
+        "h2_produced":    h2_pr,  "h2_delivered": h2_dl,
+        "h2_storage":     h2_st,  "curtailment":  curt,
+        "deficit":        defic,  "storage_draw": s_draw,
+        "storage_charge": s_chrg,
         "annual_h2_produced_t":  float(np.sum(h2_pr)) / 1000.0,
         "annual_h2_delivered_t": float(np.sum(h2_dl)) / 1000.0,
-        "deficit_hours":   int(np.sum(defic > 0)),
-        "elec_util_pct":   float(np.sum(ep > 0)) / N * 100.0,
-        "curtailment_mwh": float(np.sum(curt)),
+        "deficit_hours":    int(np.sum(defic > 0)),
+        "storage_draw_hrs": int(np.sum(s_draw > 0)),
+        "elec_util_pct":    float(np.sum(ep > 0)) / N * 100.0,
+        "curtailment_mwh":  float(np.sum(curt)),
         "solar_gen_mwh": sg, "wind_gen_mwh": wg,
         "re_self_consump": rc/(sg+wg)*100 if (sg+wg)>0 else 0.0,
     }
@@ -566,8 +586,9 @@ with tab1:
     k2.metric("H₂ Delivered",    f"{sim['annual_h2_delivered_t']:,.0f} t/yr")
     k3.metric("Deficit Hours",   f"{sim['deficit_hours']} hrs",
               "✅ Zero" if sim['deficit_hours']==0 else "⚠ Increase storage days")
-    k4.metric("Elec. Util.",     f"{sim['elec_util_pct']:.1f}%")
-    k5.metric("RE Self-Consump.",f"{sim['re_self_consump']:.1f}%")
+    k4.metric("Storage Draw Hrs",f"{sim.get('storage_draw_hrs',0)} hrs",
+              "Hours storage supplied consumer")
+    k5.metric("Elec. Util.",     f"{sim['elec_util_pct']:.1f}%")
     k6.metric("Curtailment",     f"{sim['curtailment_mwh']:,.0f} MWh")
 
     st.divider()
@@ -904,14 +925,16 @@ with tab5:
                             "GH2_Report.csv","text/csv")
     with d2:
         dd = pd.DataFrame({
-            "Hour":            np.arange(8760),
-            "RE_Power_MW":     np.round(sim["re_power"],    2),
-            "Elec_Power_MW":   np.round(sim["elec_power"],  2),
-            "H2_Produced_kg":  np.round(sim["h2_produced"], 1),
-            "H2_Delivered_kg": np.round(sim["h2_delivered"],1),
-            "H2_Storage_kg":   np.round(sim["h2_storage"],  1),
-            "Curtailment_MW":  np.round(sim["curtailment"],  2),
-            "Deficit_kg":      np.round(sim["deficit"],      1),
+            "Hour":              np.arange(8760),
+            "RE_Power_MW":       np.round(sim["re_power"],       2),
+            "Elec_Power_MW":     np.round(sim["elec_power"],     2),
+            "H2_Produced_kg":    np.round(sim["h2_produced"],    1),
+            "H2_Delivered_kg":   np.round(sim["h2_delivered"],   1),
+            "Storage_Draw_kg":   np.round(sim["storage_draw"],   1),
+            "Storage_Charge_kg": np.round(sim["storage_charge"], 1),
+            "H2_Storage_kg":     np.round(sim["h2_storage"],     1),
+            "Curtailment_MW":    np.round(sim["curtailment"],     2),
+            "Deficit_kg":        np.round(sim["deficit"],         1),
         })
         st.download_button("⬇ Download Hourly Dispatch (CSV)",
                             dd.to_csv(index=False),
