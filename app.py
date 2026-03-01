@@ -1,12 +1,7 @@
 """
-app.py
-------
-GH2 Optimiser — Streamlit Web Application
-Green Hydrogen Plant Capacity Sizing & CAPEX Optimization Engine
-
-Run with:  streamlit run app.py
+GH2 Optimiser — Single File Streamlit App
+All modules merged for Streamlit Cloud compatibility
 """
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -17,16 +12,542 @@ import io
 import sys
 import os
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(__file__))
+# ═══════════════════════════════════════════════
+#  ECONOMICS — CAPEX CALCULATION
+# ═══════════════════════════════════════════════
+def calculate_capex(
+    solar_mw: float,
+    wind_mw: float,
+    electrolyzer_mw: float,
+    storage_t: float,
+    compressor_mw: float,
+    # Unit costs (₹ Crores)
+    cost_solar: float           = 3.5,    # ₹ Cr / MWp
+    cost_wind: float            = 7.0,    # ₹ Cr / MW
+    cost_elec: float            = 7.0,    # ₹ Cr / MW
+    cost_storage: float         = 0.55,   # ₹ Cr / tH2
+    cost_compressor: float      = 4.2,    # ₹ Cr / MW
+    # Project cost adders (as fraction)
+    bop_pct: float              = 0.12,   # Balance of Plant + Civil
+    epc_pct: float              = 0.08,   # EPC Margin
+    contingency_pct: float      = 0.05,   # Contingency
+) -> dict:
+    """
+    Calculate full project CAPEX in ₹ Crores.
 
-from simulator.sizing   import run_sizing_optimization
-from simulator.dispatch import run_dispatch
-from economics.capex    import calculate_capex
+    Returns detailed breakdown dictionary.
+    """
 
-# ─────────────────────────────────────────────
-#  PAGE CONFIG
-# ─────────────────────────────────────────────
+    # ── Equipment CAPEX ──
+    cap_solar      = solar_mw       * cost_solar
+    cap_wind       = wind_mw        * cost_wind
+    cap_elec       = electrolyzer_mw* cost_elec
+    cap_storage    = storage_t      * cost_storage
+    cap_compressor = compressor_mw  * cost_compressor
+
+    equip_total = (
+        cap_solar
+        + cap_wind
+        + cap_elec
+        + cap_storage
+        + cap_compressor
+    )
+
+    # ── Project adders ──
+    cap_bop        = equip_total * bop_pct
+    cap_epc        = equip_total * epc_pct
+    cap_contingency= equip_total * contingency_pct
+
+    total_cr = equip_total + cap_bop + cap_epc + cap_contingency
+
+    return {
+        # Component breakdown
+        "cap_solar_cr":       cap_solar,
+        "cap_wind_cr":        cap_wind,
+        "cap_elec_cr":        cap_elec,
+        "cap_storage_cr":     cap_storage,
+        "cap_compressor_cr":  cap_compressor,
+        # Subtotals
+        "equip_total_cr":     equip_total,
+        "cap_bop_cr":         cap_bop,
+        "cap_epc_cr":         cap_epc,
+        "cap_contingency_cr": cap_contingency,
+        # Grand total
+        "total_cr":           total_cr,
+        # Unit cost
+        "unit_capex_cr_per_t": total_cr / max(1.0, storage_t),  # rough — overwritten later
+    }
+
+
+# ═══════════════════════════════════════════════
+#  SIMULATOR — DISPATCH ENGINE
+# ═══════════════════════════════════════════════
+def run_dispatch(
+    solar_profile: np.ndarray,   # 8760 values, kWh per MW per hour
+    wind_profile: np.ndarray,    # 8760 values, kWh per MW per hour
+    solar_mw: float,             # Solar installed capacity (MWp)
+    wind_mw: float,              # Wind installed capacity (MW)
+    electrolyzer_mw: float,      # Electrolyzer rated capacity (MW)
+    stack_mw: float,             # Single stack size (MW)
+    min_load_pct: float,         # Minimum load as fraction (0.30 = 30%)
+    efficiency_kwh_per_kg: float,# Electrolyzer efficiency (kWh per kgH2)
+    min_flow_kg_hr: float,       # Consumer min offtake (kg/hr)
+    max_flow_kg_hr: float,       # Consumer max offtake (kg/hr)
+    storage_capacity_kg: float,  # H2 storage tank capacity (kg)
+    initial_storage_kg: float = None,  # Starting storage level (kg), default 50%
+) -> dict:
+    """
+    Run a full 8760-hour dispatch simulation.
+
+    Returns a dictionary with all hourly arrays and summary metrics.
+    """
+
+    N = 8760
+
+    # Starting storage level — default 50% of capacity
+    if initial_storage_kg is None:
+        initial_storage_kg = storage_capacity_kg * 0.50
+
+    # Minimum load threshold in MW (30% of one stack)
+    min_load_mw = stack_mw * min_load_pct
+
+    # Pre-allocate output arrays
+    re_power          = np.zeros(N)   # Total RE power available (MW)
+    elec_power        = np.zeros(N)   # Electrolyzer power consumed (MW)
+    h2_produced       = np.zeros(N)   # H2 produced (kg/hr)
+    h2_delivered      = np.zeros(N)   # H2 delivered to consumer (kg/hr)
+    h2_storage        = np.zeros(N)   # H2 storage level at end of hour (kg)
+    curtailment_mw    = np.zeros(N)   # Curtailed RE power (MW)
+    storage_draw      = np.zeros(N)   # H2 drawn from storage (kg/hr)
+    storage_charge    = np.zeros(N)   # H2 added to storage (kg/hr)
+    deficit           = np.zeros(N)   # Unmet consumer demand (kg/hr)
+
+    storage_level = initial_storage_kg  # Rolling storage level (kg)
+
+    for h in range(N):
+
+        # ── Step 1: Calculate total RE power available this hour ──
+        solar_power = solar_profile[h] * solar_mw   # MW (kWh/MW × MW = kWh = MWh for 1hr)
+        wind_power  = wind_profile[h]  * wind_mw
+        total_re    = solar_power + wind_power
+        re_power[h] = total_re
+
+        # ── Step 2: Electrolyzer dispatch ──
+        # Only runs if RE >= minimum load threshold (30% of one stack)
+        if total_re >= min_load_mw:
+            ep = min(total_re, electrolyzer_mw)   # Can't exceed rated capacity
+            elec_power[h]  = ep
+            h2_prod        = ep * 1000.0 / efficiency_kwh_per_kg  # kg/hr
+            h2_produced[h] = h2_prod
+
+            # Curtailment = RE that electrolyzer could not consume
+            curtailment_mw[h] = max(0.0, total_re - electrolyzer_mw)
+        else:
+            # RE below minimum load → electrolyzer OFF
+            elec_power[h]     = 0.0
+            h2_produced[h]    = 0.0
+            curtailment_mw[h] = total_re  # All RE wasted (too low to use)
+
+        # ── Step 3: Supply to consumer ──
+        # Direct supply = H2 produced this hour, capped at Max Flow
+        direct_supply = min(h2_produced[h], max_flow_kg_hr)
+
+        # Excess H2 beyond max flow → goes to storage
+        excess_to_storage = h2_produced[h] - direct_supply
+
+        # ── Step 4: Check if direct supply meets Min Flow ──
+        shortfall = max_flow_kg_hr  # We will determine actual delivery below
+
+        if direct_supply >= min_flow_kg_hr:
+            # Production covers minimum — deliver what we produced (up to max)
+            h2_del         = direct_supply
+            storage_charge[h] = excess_to_storage
+            storage_draw[h]   = 0.0
+        else:
+            # Production below minimum — try to draw from storage
+            needed_from_storage = min_flow_kg_hr - direct_supply
+            available_in_storage = storage_level  # Current storage before this hour
+
+            draw = min(needed_from_storage, available_in_storage)
+            h2_del            = direct_supply + draw
+            storage_draw[h]   = draw
+            storage_charge[h] = excess_to_storage
+
+        # ── Step 5: Update storage level ──
+        storage_level = (
+            storage_level
+            + storage_charge[h]   # H2 added
+            - storage_draw[h]     # H2 drawn
+        )
+
+        # Clamp storage to [0, capacity]
+        storage_level = max(0.0, min(storage_level, storage_capacity_kg))
+
+        h2_storage[h]    = storage_level
+        h2_delivered[h]  = h2_del
+
+        # ── Step 6: Record deficit ──
+        if h2_del < min_flow_kg_hr:
+            deficit[h] = min_flow_kg_hr - h2_del
+        else:
+            deficit[h] = 0.0
+
+    # ── Summary Metrics ──
+    annual_h2_produced_kg  = float(np.sum(h2_produced))
+    annual_h2_delivered_kg = float(np.sum(h2_delivered))
+    annual_curtailment_mwh = float(np.sum(curtailment_mw))
+    total_deficit_kg       = float(np.sum(deficit))
+    deficit_hours          = int(np.sum(deficit > 0))
+    elec_utilization_pct   = float(np.sum(elec_power > 0)) / N * 100.0
+    avg_storage_pct        = (
+        float(np.mean(h2_storage)) / storage_capacity_kg * 100.0
+        if storage_capacity_kg > 0 else 0.0
+    )
+    solar_gen_mwh          = float(np.sum(solar_profile * solar_mw))
+    wind_gen_mwh           = float(np.sum(wind_profile  * wind_mw))
+    re_consumed_mwh        = float(np.sum(elec_power))
+    re_self_consumption_pct= (
+        re_consumed_mwh / (solar_gen_mwh + wind_gen_mwh) * 100.0
+        if (solar_gen_mwh + wind_gen_mwh) > 0 else 0.0
+    )
+
+    return {
+        # Hourly arrays
+        "re_power":          re_power,
+        "elec_power":        elec_power,
+        "h2_produced":       h2_produced,
+        "h2_delivered":      h2_delivered,
+        "h2_storage":        h2_storage,
+        "curtailment_mw":    curtailment_mw,
+        "storage_draw":      storage_draw,
+        "storage_charge":    storage_charge,
+        "deficit":           deficit,
+
+        # Summary metrics
+        "annual_h2_produced_kg":   annual_h2_produced_kg,
+        "annual_h2_produced_t":    annual_h2_produced_kg  / 1000.0,
+        "annual_h2_delivered_kg":  annual_h2_delivered_kg,
+        "annual_h2_delivered_t":   annual_h2_delivered_kg / 1000.0,
+        "annual_curtailment_mwh":  annual_curtailment_mwh,
+        "total_deficit_kg":        total_deficit_kg,
+        "deficit_hours":           deficit_hours,
+        "elec_utilization_pct":    elec_utilization_pct,
+        "avg_storage_pct":         avg_storage_pct,
+        "solar_gen_mwh":           solar_gen_mwh,
+        "wind_gen_mwh":            wind_gen_mwh,
+        "re_consumed_mwh":         re_consumed_mwh,
+        "re_self_consumption_pct": re_self_consumption_pct,
+    }
+
+
+# ═══════════════════════════════════════════════
+#  SIMULATOR — SIZING OPTIMIZER
+# ═══════════════════════════════════════════════
+def calculate_wind_start(
+    annual_h2_target_kg: float,
+    efficiency_kwh_per_kg: float,
+    solar_mw: float,
+    solar_profile: np.ndarray,
+    wind_profile: np.ndarray,
+    wind_floor_mw: float,
+) -> float:
+    """
+    Calculate the starting point for Wind MW based on energy gap.
+
+    Wind_start = max(
+        (Total Energy Needed - Solar Generation) / Wind Annual kWh per MW,
+        Wind floor (50% of Solar)
+    )
+    """
+    # Energy in MWh (profiles are in MWh per MW per hour, so sum = MWh/MW/yr)
+    total_energy_needed_mwh = annual_h2_target_kg * efficiency_kwh_per_kg / 1000.0
+
+    annual_solar_mwh_per_mw = float(np.sum(solar_profile))  # MWh/MW/yr
+    annual_wind_mwh_per_mw  = float(np.sum(wind_profile))   # MWh/MW/yr
+
+    solar_generation_mwh = solar_mw * annual_solar_mwh_per_mw
+
+    energy_gap_mwh = max(0.0, total_energy_needed_mwh - solar_generation_mwh)
+
+    if annual_wind_mwh_per_mw > 0:
+        wind_from_gap = energy_gap_mwh / annual_wind_mwh_per_mw
+    else:
+        wind_from_gap = 0.0
+
+    wind_start = max(wind_from_gap, wind_floor_mw)
+
+    return max(1.0, round(wind_start))  # At least 1 MW
+
+
+def find_minimum_storage(
+    solar_profile: np.ndarray,
+    wind_profile: np.ndarray,
+    solar_mw: float,
+    wind_mw: float,
+    electrolyzer_mw: float,
+    stack_mw: float,
+    min_load_pct: float,
+    efficiency_kwh_per_kg: float,
+    min_flow_kg_hr: float,
+    max_flow_kg_hr: float,
+    annual_h2_target_kg: float,
+    storage_step_t: float = 10.0,   # Increment in tonnes
+    max_storage_t: float = 50000.0, # Upper bound safety cap
+    progress_callback=None,
+) -> tuple:
+    """
+    Find the minimum H2 storage (tH2) that results in:
+      1. Zero deficit hours
+      2. Annual H2 delivered >= target
+
+    Increments storage by storage_step_t tonnes at a time.
+
+    Returns (storage_tonnes, simulation_result)
+    """
+    storage_t = 0.0
+
+    while storage_t <= max_storage_t:
+        storage_kg = storage_t * 1000.0
+
+        result = run_dispatch(
+            solar_profile        = solar_profile,
+            wind_profile         = wind_profile,
+            solar_mw             = solar_mw,
+            wind_mw              = wind_mw,
+            electrolyzer_mw      = electrolyzer_mw,
+            stack_mw             = stack_mw,
+            min_load_pct         = min_load_pct,
+            efficiency_kwh_per_kg= efficiency_kwh_per_kg,
+            min_flow_kg_hr       = min_flow_kg_hr,
+            max_flow_kg_hr       = max_flow_kg_hr,
+            storage_capacity_kg  = storage_kg,
+        )
+
+        if (
+            result["deficit_hours"] == 0
+            and result["annual_h2_delivered_t"] >= annual_h2_target_kg / 1000.0 * 0.99
+        ):
+            return storage_t, result
+
+        storage_t += storage_step_t
+
+        if progress_callback:
+            progress_callback(storage_t)
+
+    # Return best found even if not perfect
+    return storage_t, result
+
+
+def run_sizing_optimization(
+    solar_profile: np.ndarray,
+    wind_profile: np.ndarray,
+    # Demand inputs
+    annual_h2_target_t: float,      # tonnes/year
+    min_flow_kg_hr: float,          # kg/hr
+    max_flow_kg_hr: float,          # kg/hr
+    op_days: int,                   # days/year
+    hrs_per_day: float,             # hours/day
+    # Electrolyzer config
+    stack_mw: float,                # MW per stack
+    efficiency_kwh_per_kg: float,   # kWh/kgH2
+    min_load_pct: float,            # 0.30
+    availability: float,            # 0.95
+    # Search bounds
+    elec_min_mw: float,             # Start of outer loop
+    elec_max_mw: float,             # End of outer loop
+    wind_step_mw: float = 1.0,      # Wind inner loop step
+    # Cost inputs (₹ Crores)
+    cost_solar_cr_per_mwp: float    = 3.5,
+    cost_wind_cr_per_mw: float      = 7.0,
+    cost_elec_cr_per_mw: float      = 7.0,
+    cost_storage_cr_per_t: float    = 0.55,
+    cost_compressor_cr_per_mw: float= 4.2,
+    bop_pct: float                  = 0.12,
+    epc_pct: float                  = 0.08,
+    contingency_pct: float          = 0.05,
+    # Progress callback
+    progress_callback=None,
+) -> dict:
+    """
+    Main sizing optimization loop.
+
+    Returns dictionary with:
+      - best configuration (Elec MW, Solar MW, Wind MW)
+      - storage tonnes (from separate pass)
+      - CAPEX breakdown
+      - Full simulation result
+      - All sweep results for plotting
+    """
+
+    annual_h2_target_kg = annual_h2_target_t * 1000.0
+    op_hours            = op_days * hrs_per_day
+
+    sweep_results = []   # All valid configurations for plotting
+    best_capex    = np.inf
+    best_config   = None
+
+    # Outer loop step = 1 stack at a time
+    elec_step = stack_mw
+
+    total_steps = int((elec_max_mw - elec_min_mw) / elec_step) + 1
+    step_count  = 0
+
+    elec_mw = elec_min_mw
+
+    while elec_mw <= elec_max_mw:
+
+        step_count += 1
+
+        # ── Solar = Electrolyzer (proportional, locked) ──
+        solar_mw   = elec_mw
+        wind_floor = solar_mw * 0.50   # 50% of solar
+
+        # ── Wind starting point ──
+        wind_start = calculate_wind_start(
+            annual_h2_target_kg   = annual_h2_target_kg,
+            efficiency_kwh_per_kg = efficiency_kwh_per_kg,
+            solar_mw              = solar_mw,
+            solar_profile         = solar_profile,
+            wind_profile          = wind_profile,
+            wind_floor_mw         = wind_floor,
+        )
+
+        # ── Inner loop: Wind MW ──
+        wind_mw         = wind_start
+        inner_converged = False
+        max_wind_tries  = 500   # Safety cap
+
+        for _ in range(max_wind_tries):
+
+            # Quick check without storage to see if annual target is reachable
+            # Use a large storage so storage never limits production
+            result = run_dispatch(
+                solar_profile         = solar_profile,
+                wind_profile          = wind_profile,
+                solar_mw              = solar_mw,
+                wind_mw               = wind_mw,
+                electrolyzer_mw       = elec_mw,
+                stack_mw              = stack_mw,
+                min_load_pct          = min_load_pct,
+                efficiency_kwh_per_kg = efficiency_kwh_per_kg,
+                min_flow_kg_hr        = min_flow_kg_hr,
+                max_flow_kg_hr        = max_flow_kg_hr,
+                storage_capacity_kg   = 1e9,  # Unlimited storage for production check
+            )
+
+            if result["annual_h2_delivered_t"] >= annual_h2_target_t * 0.99:
+                inner_converged = True
+                break
+
+            wind_mw += wind_step_mw
+
+        if not inner_converged:
+            elec_mw += elec_step
+            continue
+
+        # ── Compressor MW: sized for max H2 flow ──
+        compressor_mw = max(1.0, round(max_flow_kg_hr / 1000.0 * 0.055, 1))
+
+        # ── Estimate storage (rough) for CAPEX sweep ──
+        # Use 2-day buffer as placeholder — exact storage found after best config selected
+        avg_flow_kg_hr   = annual_h2_target_kg / op_hours
+        rough_storage_t  = max(10.0, round(avg_flow_kg_hr * 48 / 1000.0 / 10) * 10)
+
+        # ── Calculate CAPEX for this configuration ──
+        capex = calculate_capex(
+            solar_mw             = solar_mw,
+            wind_mw              = wind_mw,
+            electrolyzer_mw      = elec_mw,
+            storage_t            = rough_storage_t,
+            compressor_mw        = compressor_mw,
+            cost_solar           = cost_solar_cr_per_mwp,
+            cost_wind            = cost_wind_cr_per_mw,
+            cost_elec            = cost_elec_cr_per_mw,
+            cost_storage         = cost_storage_cr_per_t,
+            cost_compressor      = cost_compressor_cr_per_mw,
+            bop_pct              = bop_pct,
+            epc_pct              = epc_pct,
+            contingency_pct      = contingency_pct,
+        )
+
+        sweep_results.append({
+            "electrolyzer_mw":  elec_mw,
+            "solar_mw":         solar_mw,
+            "wind_mw":          wind_mw,
+            "storage_t":        rough_storage_t,
+            "compressor_mw":    compressor_mw,
+            "total_capex_cr":   capex["total_cr"],
+            "capex_breakdown":  capex,
+            "h2_delivered_t":   result["annual_h2_delivered_t"],
+            "elec_util_pct":    result["elec_utilization_pct"],
+            "curtailment_mwh":  result["annual_curtailment_mwh"],
+        })
+
+        if progress_callback:
+            progress_callback(step_count, total_steps, elec_mw, capex["total_cr"])
+
+        if capex["total_cr"] < best_capex:
+            best_capex  = capex["total_cr"]
+            best_config = {
+                "electrolyzer_mw": elec_mw,
+                "solar_mw":        solar_mw,
+                "wind_mw":         wind_mw,
+                "compressor_mw":   compressor_mw,
+            }
+
+        elec_mw += elec_step
+
+    if best_config is None:
+        raise ValueError(
+            "No valid configuration found. "
+            "Check demand inputs and RE profiles."
+        )
+
+    # ── Storage sizing pass ──
+    # Now find exact minimum storage for zero deficit at best config
+    storage_t, final_sim = find_minimum_storage(
+        solar_profile         = solar_profile,
+        wind_profile          = wind_profile,
+        solar_mw              = best_config["solar_mw"],
+        wind_mw               = best_config["wind_mw"],
+        electrolyzer_mw       = best_config["electrolyzer_mw"],
+        stack_mw              = stack_mw,
+        min_load_pct          = min_load_pct,
+        efficiency_kwh_per_kg = efficiency_kwh_per_kg,
+        min_flow_kg_hr        = min_flow_kg_hr,
+        max_flow_kg_hr        = max_flow_kg_hr,
+        annual_h2_target_kg   = annual_h2_target_kg,
+    )
+
+    best_config["storage_t"] = storage_t
+
+    # ── Final CAPEX with correct storage ──
+    final_capex = calculate_capex(
+        solar_mw         = best_config["solar_mw"],
+        wind_mw          = best_config["wind_mw"],
+        electrolyzer_mw  = best_config["electrolyzer_mw"],
+        storage_t        = storage_t,
+        compressor_mw    = best_config["compressor_mw"],
+        cost_solar       = cost_solar_cr_per_mwp,
+        cost_wind        = cost_wind_cr_per_mw,
+        cost_elec        = cost_elec_cr_per_mw,
+        cost_storage     = cost_storage_cr_per_t,
+        cost_compressor  = cost_compressor_cr_per_mw,
+        bop_pct          = bop_pct,
+        epc_pct          = epc_pct,
+        contingency_pct  = contingency_pct,
+    )
+
+    return {
+        "best_config":    best_config,
+        "final_capex":    final_capex,
+        "final_sim":      final_sim,
+        "sweep_results":  sweep_results,
+        "op_hours":       op_hours,
+        "annual_h2_target_t": annual_h2_target_t,
+    }
+
+
 st.set_page_config(
     page_title   = "GH2 Optimiser",
     page_icon    = "⚗",
