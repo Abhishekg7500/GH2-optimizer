@@ -528,9 +528,9 @@ sp    = res["sp"]
 wp    = res["wp"]
 n_st  = int(np.ceil(cfg["electrolyzer_mw"] / inp["stack_mw"]))
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 Results", "⚡ Dispatch", "₹ CAPEX Breakdown",
-    "📈 Optimization Curve", "📋 Report",
+    "📈 Optimization Curve", "📋 Report", "🗃 Hourly Data",
 ])
 
 
@@ -925,9 +925,30 @@ with tab5:
                             df_r.to_csv(index=False),
                             "GH2_Report.csv","text/csv")
     with d2:
+        # Build month/day/hour labels
+        month_col, day_col, hour_col = [], [], []
+        month_names = ["Jan","Feb","Mar","Apr","May","Jun",
+                       "Jul","Aug","Sep","Oct","Nov","Dec"]
+        month_days_list = [31,28,31,30,31,30,31,31,30,31,30,31]
+        for mi, days in enumerate(month_days_list):
+            for d in range(1, days+1):
+                for hr in range(24):
+                    month_col.append(month_names[mi])
+                    day_col.append(d)
+                    hour_col.append(hr)
+
+        solar_gen_hr = np.round(sp * cfg["solar_mw"], 2)
+        wind_gen_hr  = np.round(wp * cfg["wind_mw"],  2)
+        total_gen_hr = np.round(solar_gen_hr + wind_gen_hr, 2)
+
         dd = pd.DataFrame({
             "Hour":              np.arange(8760),
-            "RE_Power_MW":       np.round(sim["re_power"],       2),
+            "Month":             month_col,
+            "Day":               day_col,
+            "Hour_of_Day":       hour_col,
+            "Solar_Gen_MW":      solar_gen_hr,
+            "Wind_Gen_MW":       wind_gen_hr,
+            "Total_RE_Gen_MW":   total_gen_hr,
             "Elec_Power_MW":     np.round(sim["elec_power"],     2),
             "H2_Produced_kg":    np.round(sim["h2_produced"],    1),
             "H2_Delivered_kg":   np.round(sim["h2_delivered"],   1),
@@ -940,3 +961,189 @@ with tab5:
         st.download_button("⬇ Download Hourly Dispatch (CSV)",
                             dd.to_csv(index=False),
                             "GH2_Dispatch.csv","text/csv")
+
+
+# ════════════════════════════════
+#  TAB 6 — HOURLY DATA VIEWER
+# ════════════════════════════════
+with tab6:
+    st.markdown("#### 🗃 Hourly Data Viewer")
+    st.caption("Browse all 8760 hours of simulation data directly in the app")
+
+    # Build the full hourly dataframe
+    month_names_hd   = ["Jan","Feb","Mar","Apr","May","Jun",
+                         "Jul","Aug","Sep","Oct","Nov","Dec"]
+    month_days_hd    = [31,28,31,30,31,30,31,31,30,31,30,31]
+    month_col_hd, day_col_hd, hour_col_hd = [], [], []
+    for mi, days in enumerate(month_days_hd):
+        for d in range(1, days+1):
+            for hr in range(24):
+                month_col_hd.append(month_names_hd[mi])
+                day_col_hd.append(d)
+                hour_col_hd.append(hr)
+
+    solar_gen_hd = np.round(sp * cfg["solar_mw"], 2)
+    wind_gen_hd  = np.round(wp * cfg["wind_mw"],  2)
+    total_gen_hd = np.round(solar_gen_hd + wind_gen_hd, 2)
+
+    hourly_df = pd.DataFrame({
+        "Hour":              np.arange(8760),
+        "Month":             month_col_hd,
+        "Day":               day_col_hd,
+        "Hour_of_Day":       hour_col_hd,
+        "Solar_Gen_MW":      solar_gen_hd,
+        "Wind_Gen_MW":       wind_gen_hd,
+        "Total_RE_Gen_MW":   total_gen_hd,
+        "Elec_Power_MW":     np.round(sim["elec_power"],     2),
+        "H2_Produced_kg":    np.round(sim["h2_produced"],    1),
+        "H2_Delivered_kg":   np.round(sim["h2_delivered"],   1),
+        "Storage_Draw_kg":   np.round(sim["storage_draw"],   1),
+        "Storage_Charge_kg": np.round(sim["storage_charge"], 1),
+        "H2_Storage_kg":     np.round(sim["h2_storage"],     1),
+        "Curtailment_MW":    np.round(sim["curtailment"],     2),
+        "Deficit_kg":        np.round(sim["deficit"],         1),
+    })
+
+    # ── Filter controls ──
+    st.markdown("##### 🔍 Filter Data")
+    fc1, fc2, fc3 = st.columns(3)
+
+    with fc1:
+        sel_months = st.multiselect(
+            "Filter by Month",
+            options=month_names_hd,
+            default=month_names_hd,
+        )
+
+    with fc2:
+        hour_range = st.slider(
+            "Hour of Day",
+            min_value=0, max_value=23, value=(0, 23),
+        )
+
+    with fc3:
+        show_filter = st.selectbox(
+            "Show Only",
+            options=[
+                "All Hours",
+                "Storage Drawing Hours",
+                "Deficit Hours",
+                "Curtailment Hours",
+                "Zero Production Hours",
+                "Below Min Flow Hours",
+            ]
+        )
+
+    # Apply filters
+    filtered = hourly_df[hourly_df["Month"].isin(sel_months)]
+    filtered = filtered[
+        (filtered["Hour_of_Day"] >= hour_range[0]) &
+        (filtered["Hour_of_Day"] <= hour_range[1])
+    ]
+
+    if show_filter == "Storage Drawing Hours":
+        filtered = filtered[filtered["Storage_Draw_kg"] > 0]
+    elif show_filter == "Deficit Hours":
+        filtered = filtered[filtered["Deficit_kg"] > 0]
+    elif show_filter == "Curtailment Hours":
+        filtered = filtered[filtered["Curtailment_MW"] > 0]
+    elif show_filter == "Zero Production Hours":
+        filtered = filtered[filtered["H2_Produced_kg"] == 0]
+    elif show_filter == "Below Min Flow Hours":
+        filtered = filtered[filtered["H2_Delivered_kg"] < inp["min_flow"]]
+
+    # ── Summary stats for filtered data ──
+    st.markdown(f"**Showing {len(filtered):,} of 8,760 hours**")
+
+    sm1, sm2, sm3, sm4, sm5 = st.columns(5)
+    sm1.metric("Avg Solar Gen",    f"{filtered['Solar_Gen_MW'].mean():.1f} MW")
+    sm2.metric("Avg Wind Gen",     f"{filtered['Wind_Gen_MW'].mean():.1f} MW")
+    sm3.metric("Avg H₂ Produced",  f"{filtered['H2_Produced_kg'].mean():.0f} kg/hr")
+    sm4.metric("Avg H₂ Delivered", f"{filtered['H2_Delivered_kg'].mean():.0f} kg/hr")
+    sm5.metric("Total Deficit",    f"{filtered['Deficit_kg'].sum()/1000:.1f} tH₂")
+
+    st.divider()
+
+    # ── Column selector ──
+    all_cols = hourly_df.columns.tolist()
+    default_cols = ["Hour","Month","Day","Hour_of_Day",
+                    "Solar_Gen_MW","Wind_Gen_MW","Total_RE_Gen_MW",
+                    "Elec_Power_MW","H2_Produced_kg","H2_Delivered_kg",
+                    "Storage_Draw_kg","H2_Storage_kg","Deficit_kg"]
+
+    selected_cols = st.multiselect(
+        "Select Columns to Display",
+        options=all_cols,
+        default=default_cols,
+    )
+
+    # ── Data table ──
+    st.dataframe(
+        filtered[selected_cols].reset_index(drop=True),
+        use_container_width=True,
+        height=500,
+    )
+
+    st.divider()
+
+    # ── Quick charts from filtered data ──
+    st.markdown("##### 📊 Quick Charts")
+    cc1, cc2 = st.columns(2)
+
+    with cc1:
+        # RE generation breakdown for filtered hours
+        fig_re = go.Figure()
+        fig_re.add_trace(go.Scatter(
+            x=filtered["Hour"], y=filtered["Solar_Gen_MW"],
+            name="Solar MW", mode="lines",
+            line=dict(color=C["solar"], width=1),
+            fill="tozeroy", fillcolor="rgba(245,166,35,0.15)",
+        ))
+        fig_re.add_trace(go.Scatter(
+            x=filtered["Hour"],
+            y=filtered["Solar_Gen_MW"] + filtered["Wind_Gen_MW"],
+            name="Solar + Wind MW", mode="lines",
+            line=dict(color=C["wind"], width=1),
+            fill="tonexty", fillcolor="rgba(33,150,243,0.15)",
+        ))
+        fig_re.update_layout(**PL, height=280,
+                              title="Solar & Wind Generation (MW)",
+                              xaxis_title="Hour", yaxis_title="MW")
+        st.plotly_chart(fig_re, use_container_width=True)
+
+    with cc2:
+        # H2 produced vs delivered
+        fig_h2 = go.Figure()
+        fig_h2.add_trace(go.Scatter(
+            x=filtered["Hour"], y=filtered["H2_Produced_kg"],
+            name="H₂ Produced", mode="lines",
+            line=dict(color=C["teal"], width=1),
+        ))
+        fig_h2.add_trace(go.Scatter(
+            x=filtered["Hour"], y=filtered["H2_Delivered_kg"],
+            name="H₂ Delivered", mode="lines",
+            line=dict(color=C["demand"], width=1, dash="dash"),
+        ))
+        fig_h2.add_hline(y=inp["min_flow"], line_dash="dot",
+                          line_color="rgba(244,67,54,0.5)",
+                          annotation_text=f"Min {inp['min_flow']} kg/hr")
+        fig_h2.update_layout(**PL, height=280,
+                              title="H₂ Produced vs Delivered (kg/hr)",
+                              xaxis_title="Hour", yaxis_title="kg/hr")
+        st.plotly_chart(fig_h2, use_container_width=True)
+
+    # Storage level chart
+    fig_stor = go.Figure()
+    fig_stor.add_trace(go.Scatter(
+        x=filtered["Hour"], y=filtered["H2_Storage_kg"]/1000,
+        name="Storage Level (tH₂)", mode="lines",
+        line=dict(color=C["storage"], width=1.5),
+        fill="tozeroy", fillcolor="rgba(76,175,80,0.10)",
+    ))
+    fig_stor.add_hline(y=cfg["storage_t"], line_dash="dot",
+                        line_color="rgba(200,150,0,0.5)",
+                        annotation_text=f"Capacity {cfg['storage_t']:.0f} tH₂")
+    fig_stor.update_layout(**PL, height=250,
+                            title="H₂ Storage Level (tH₂)",
+                            xaxis_title="Hour", yaxis_title="tH₂")
+    st.plotly_chart(fig_stor, use_container_width=True)
