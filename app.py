@@ -232,14 +232,13 @@ def get_wind_mw(h2_target_t, eff, solar_mw, sp, wp):
 
 
 def run_optimization(sp, wp, h2_target_t, min_flow, max_flow,
-                     op_hours, stack_mw, eff, min_load_pct, stor_days,
+                     op_hours, stack_mw, eff, min_load_pct, stor_t,
                      cs, cw, ce, cst, cc, bop, epc, cont,
                      progress_cb=None):
 
     h2_kg    = h2_target_t * 1000.0
     avg_flow = h2_kg / op_hours
-    stor_kg  = avg_flow * stor_days * 24.0
-    stor_t   = stor_kg / 1000.0
+    stor_kg  = stor_t * 1000.0   # direct from user input in tH2
     comp_mw  = max(1.0, round(max_flow / 1000.0 * 0.055, 1))
 
     # Step 1 — minimum electrolyzer from annual math
@@ -376,20 +375,21 @@ with st.sidebar:
     st.markdown(f"""<div class="derived-box">
     Min Elec (calc)    = {min_elec_calc:.1f} MW<br>
     Min Elec (rounded) = {min_elec_rounded:.0f} MW<br>
-    = {min_elec_rounded/stack_mw if stack_mw>0 else 0:.0f} × {stack_mw} MW stacks<br>
+    = {int(min_elec_rounded/stack_mw) if stack_mw>0 else 0} × {stack_mw} MW stacks<br>
     Sweep starts here ↑
     </div>""", unsafe_allow_html=True)
 
     st.divider()
     st.markdown('<div class="sidebar-section">🔵 H₂ Storage</div>', unsafe_allow_html=True)
-    storage_days = st.number_input("Storage Buffer (days)", min_value=0.5,
-                                    max_value=30.0, value=3.0, step=0.5,
-                                    help="Storage = Avg Flow × Days × 24 hrs")
-    stor_calc_t  = avg_flow * storage_days * 24 / 1000
-
+    storage_t_input = st.number_input(
+        "Storage Capacity (tH₂)",
+        min_value=1.0, max_value=10000.0, value=100.0, step=10.0,
+        help="Total H₂ storage tank capacity in tonnes"
+    )
     st.markdown(f"""<div class="derived-box">
-    Storage = {avg_flow:.0f} × {storage_days}d × 24h<br>
-            = {stor_calc_t:.0f} tH₂
+    Storage = {storage_t_input:.0f} tH₂<br>
+    = {storage_t_input*1000:.0f} kg<br>
+    ≈ {storage_t_input/(avg_flow*24/1000):.1f} days of avg demand
     </div>""", unsafe_allow_html=True)
 
     st.divider()
@@ -468,7 +468,7 @@ if run_btn:
                 h2_target_t=h2_annual, min_flow=float(min_flow),
                 max_flow=float(max_flow), op_hours=float(op_hours),
                 stack_mw=float(stack_mw), eff=float(efficiency),
-                min_load_pct=float(min_load_pct), stor_days=float(storage_days),
+                min_load_pct=float(min_load_pct), stor_t=float(storage_t_input),
                 cs=float(cost_solar), cw=float(cost_wind), ce=float(cost_elec),
                 cst=float(cost_stor), cc=float(cost_comp),
                 bop=float(bop_pct), epc=float(epc_pct), cont=float(cont_pct),
@@ -478,7 +478,8 @@ if run_btn:
             res["inp"] = dict(
                 h2_annual=h2_annual, min_flow=min_flow, max_flow=max_flow,
                 op_days=op_days, hrs_per_day=hrs_per_day, op_hours=op_hours,
-                stack_mw=stack_mw, efficiency=efficiency, storage_days=storage_days,
+                stack_mw=stack_mw, efficiency=efficiency,
+                storage_t=storage_t_input,
             )
             st.session_state.results = res
 
@@ -575,7 +576,7 @@ with tab1:
     c1.metric("☀ Solar PV",     f"{cfg['solar_mw']:.0f} MWp",  f"₹ {cap['cap_solar_cr']:.1f} Cr")
     c2.metric("💨 Wind",         f"{cfg['wind_mw']:.0f} MW",    f"₹ {cap['cap_wind_cr']:.1f} Cr")
     c3.metric("⚡ Electrolyzer", f"{cfg['electrolyzer_mw']:.0f} MW", f"{n_st} × {inp['stack_mw']} MW")
-    c4.metric("🔵 H₂ Storage",   f"{cfg['storage_t']:.0f} tH₂", f"{inp['storage_days']} days")
+    c4.metric("🔵 H₂ Storage",   f"{cfg['storage_t']:.0f} tH₂", f"₹ {cap['cap_storage_cr']:.1f} Cr")
     c5.metric("⚙ Compressor",   f"{cfg['compressor_mw']:.1f} MW", f"₹ {cap['cap_compressor_cr']:.1f} Cr")
 
     st.divider()
@@ -892,7 +893,7 @@ with tab5:
     r("Sizing","Optimal Elec",       f"{cfg['electrolyzer_mw']:.0f}","MW",  "Min CAPEX from sweep")
     r("Sizing","Solar = Elec",       f"{cfg['solar_mw']:.0f}",     "MWp",   "Locked equal")
     r("Sizing","Wind",               f"{cfg['wind_mw']:.0f}",      "MW",    "From energy gap")
-    r("Sizing","Storage",            f"{cfg['storage_t']:.0f}",    "tH₂",   f"{inp['storage_days']}d × avg flow")
+    r("Sizing","Storage Capacity",    f"{cfg['storage_t']:.0f}",    "tH₂",   "User defined direct input")
 
     r("Performance","H₂ Produced",   f"{sim['annual_h2_produced_t']:,.0f}",  "t/yr","")
     r("Performance","H₂ Delivered",  f"{sim['annual_h2_delivered_t']:,.0f}", "t/yr","")
