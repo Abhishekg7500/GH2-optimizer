@@ -560,13 +560,13 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
-  /* Dark background */
-  .stApp { background-color: #060c14; color: #c0d8e8; }
+  /* Light mode */
+  .stApp { background-color: #f5f7fa; color: #1a2b3c; }
 
   /* Sidebar */
   section[data-testid="stSidebar"] {
-    background-color: #091422;
-    border-right: 1px solid #183048;
+    background-color: #ffffff;
+    border-right: 1px solid #dde3ea;
   }
 
   /* Headers */
@@ -575,20 +575,20 @@ st.markdown("""
 
   /* Metric cards */
   [data-testid="metric-container"] {
-    background: #0c1c2e;
-    border: 1px solid #183048;
+    background: #ffffff;
+    border: 1px solid #dde3ea;
     padding: 12px 16px;
     border-radius: 2px;
   }
-  [data-testid="metric-container"] label { color: #3a6080 !important; font-size: 11px; letter-spacing: 1px; }
-  [data-testid="metric-container"] [data-testid="stMetricValue"] { color: #00bfa8 !important; font-size: 22px; }
+  [data-testid="metric-container"] label { color: #5a7a90 !important; font-size: 11px; letter-spacing: 1px; }
+  [data-testid="metric-container"] [data-testid="stMetricValue"] { color: #007a6a !important; font-size: 22px; }
   [data-testid="metric-container"] [data-testid="stMetricDelta"] { font-size: 11px; }
 
   /* Buttons */
   .stButton > button {
-    background: linear-gradient(135deg, rgba(0,191,168,0.12), rgba(41,171,255,0.06));
-    border: 1px solid #00bfa8;
-    color: #00bfa8;
+    background: linear-gradient(135deg, rgba(0,150,130,0.12), rgba(0,120,200,0.06));
+    border: 1px solid #007a6a;
+    color: #007a6a;
     font-weight: 700;
     letter-spacing: 2px;
     text-transform: uppercase;
@@ -597,29 +597,29 @@ st.markdown("""
     font-size: 14px;
   }
   .stButton > button:hover {
-    background: rgba(0,191,168,0.2);
-    border-color: #00bfa8;
-    color: #00bfa8;
+    background: rgba(0,150,130,0.15);
+    border-color: #007a6a;
+    color: #007a6a;
   }
 
   /* Number inputs */
-  .stNumberInput input { background: #0c1c2e; color: #c0d8e8; border: 1px solid #183048; font-family: monospace; }
+  .stNumberInput input { background: #ffffff; color: #1a2b3c; border: 1px solid #dde3ea; font-family: monospace; }
 
   /* Section dividers */
-  hr { border-color: #183048; }
+  hr { border-color: #dde3ea; }
 
   /* Tables */
-  .stDataFrame { border: 1px solid #183048; }
+  .stDataFrame { border: 1px solid #dde3ea; }
 
   /* Info boxes */
   .derived-box {
-    background: rgba(0,191,168,0.06);
-    border: 1px solid rgba(0,191,168,0.3);
+    background: rgba(0,150,130,0.06);
+    border: 1px solid rgba(0,150,130,0.3);
     border-radius: 2px;
     padding: 10px 14px;
     font-family: monospace;
     font-size: 13px;
-    color: #00bfa8;
+    color: #007a6a;
     margin: 8px 0;
   }
 
@@ -637,12 +637,12 @@ st.markdown("""
 #  PLOTLY THEME
 # ─────────────────────────────────────────────
 PLOTLY_LAYOUT = dict(
-    paper_bgcolor = "#091422",
-    plot_bgcolor  = "#0c1c2e",
-    font          = dict(color="#7fb0cc", family="JetBrains Mono, monospace", size=11),
-    xaxis         = dict(gridcolor="#183048", linecolor="#183048", zerolinecolor="#183048"),
-    yaxis         = dict(gridcolor="#183048", linecolor="#183048", zerolinecolor="#183048"),
-    legend        = dict(bgcolor="rgba(0,0,0,0)", bordercolor="#183048", borderwidth=1),
+    paper_bgcolor = "#ffffff",
+    plot_bgcolor  = "#f8fafb",
+    font          = dict(color="#3a5a70", family="Segoe UI, sans-serif", size=11),
+    xaxis         = dict(gridcolor="#e0e8f0", linecolor="#d0d8e0", zerolinecolor="#d0d8e0"),
+    yaxis         = dict(gridcolor="#e0e8f0", linecolor="#d0d8e0", zerolinecolor="#d0d8e0"),
+    legend        = dict(bgcolor="rgba(255,255,255,0.9)", bordercolor="#d0d8e0", borderwidth=1),
     margin        = dict(l=50, r=30, t=40, b=50),
 )
 
@@ -836,15 +836,15 @@ with st.sidebar:
 #  HEADER
 # ─────────────────────────────────────────────
 st.markdown("""
-<div style="background:linear-gradient(135deg,#091422,#0c1c2e);
-            border-bottom:1px solid #183048;
+<div style="background:linear-gradient(135deg,#e8f4f8,#f0f8ff);
+            border-bottom:1px solid #c0d8e8;
             padding:20px 28px 16px;
             margin-bottom:24px;">
-  <span style="font-size:26px;font-weight:900;color:#00bfa8;
+  <span style="font-size:26px;font-weight:900;color:#007a6a;
                letter-spacing:4px;font-family:'Exo 2',sans-serif;">
     GH2 OPTIMISER
   </span>
-  <span style="font-size:12px;color:#3a6080;margin-left:16px;
+  <span style="font-size:12px;color:#5a7a90;margin-left:16px;
                font-family:monospace;letter-spacing:1px;">
     Green Hydrogen Plant · CAPEX Optimization Engine · ₹ Crores
   </span>
@@ -1006,9 +1006,9 @@ res = st.session_state.results
 if res is None:
     # ── Welcome screen ──
     st.markdown("""
-    <div style="text-align:center;padding:80px 40px;color:#3a6080;">
+    <div style="text-align:center;padding:80px 40px;color:#5a7a90;">
       <div style="font-size:64px;">⚗</div>
-      <div style="font-size:20px;color:#7fb0cc;margin:16px 0;font-family:monospace;letter-spacing:2px;">
+      <div style="font-size:20px;color:#3a7a9a;margin:16px 0;font-family:monospace;letter-spacing:2px;">
         GH2 CAPEX OPTIMIZER
       </div>
       <div style="font-size:13px;line-height:2;max-width:600px;margin:0 auto;">
@@ -1055,17 +1055,17 @@ with tab1:
 
     # ── Total CAPEX banner ──
     st.markdown(f"""
-    <div style="background:linear-gradient(135deg,rgba(255,181,32,0.08),rgba(0,191,168,0.05));
-                border:1px solid rgba(255,181,32,0.35);
+    <div style="background:linear-gradient(135deg,rgba(255,181,32,0.10),rgba(0,150,130,0.06));
+                border:1px solid rgba(200,140,0,0.35);
                 padding:20px 28px; margin-bottom:24px;">
-      <div style="font-size:11px;color:#ffb520;letter-spacing:3px;font-family:monospace;">
+      <div style="font-size:11px;color:#b07800;letter-spacing:3px;font-family:monospace;">
         MINIMUM PROJECT CAPEX
       </div>
-      <div style="font-size:42px;font-weight:700;color:#ffb520;
-                  text-shadow:0 0 24px rgba(255,181,32,0.4);font-family:monospace;">
+      <div style="font-size:42px;font-weight:700;color:#b07800;
+                  text-shadow:0 0 8px rgba(200,140,0,0.2);font-family:monospace;">
         ₹ {capex['total_cr']:,.2f} <span style="font-size:18px;">Crores</span>
       </div>
-      <div style="font-size:11px;color:#3a6080;margin-top:4px;">
+      <div style="font-size:11px;color:#5a7a90;margin-top:4px;">
         Includes Equipment + BOP + EPC + Contingency &nbsp;|&nbsp;
         Unit: ₹ {capex['total_cr']/inp['h2_annual_t']:.3f} Cr / (tH₂/yr)
       </div>
@@ -1149,10 +1149,10 @@ with tab1:
         badge = "✅" if ok else "⚠️"
         with cols[i % 3]:
             st.markdown(f"""
-            <div style="background:#0c1c2e;border:1px solid {'#183048' if ok else 'rgba(255,181,32,0.3)'};
+            <div style="background:#ffffff;border:1px solid {'#183048' if ok else 'rgba(255,181,32,0.3)'};
                         padding:10px 14px;margin-bottom:8px;">
               <div style="font-size:10px;color:#3a6080;font-family:monospace;letter-spacing:1px;">{label}</div>
-              <div style="font-size:13px;color:{'#5ef090' if ok else '#ffb520'};margin-top:4px;">
+              <div style="font-size:13px;color:{'#007a6a' if ok else '#c07800'};margin-top:4px;">
                 {badge} {val}
               </div>
             </div>
@@ -1310,7 +1310,7 @@ with tab3:
         fig_pie = go.Figure(go.Pie(
             labels=labels, values=[round(v,2) for v in values],
             hole=0.52,
-            marker=dict(colors=colors_pie, line=dict(color="#091422", width=2)),
+            marker=dict(colors=colors_pie, line=dict(color="#ffffff", width=2)),
             textinfo="label+percent",
             textfont=dict(size=10),
         ))
