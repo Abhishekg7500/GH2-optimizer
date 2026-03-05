@@ -126,6 +126,30 @@ if "results" not in st.session_state:
 
 
 # ══════════════════════════════════════════
+#  TOD HELPER
+# ══════════════════════════════════════════
+
+def get_tod_slot(hour_of_day):
+    """
+    Return TOD slot for a given hour (0-23).
+    Off-Peak : 09-17
+    Peak     : 05-09 and 19-23
+    Normal   : 23-05 and 17-19
+    """
+    h = int(hour_of_day)
+    if 9 <= h < 17:
+        return "off_peak"
+    elif (5 <= h < 9) or (19 <= h < 23):
+        return "peak"
+    else:
+        return "normal"
+
+# Pre-build TOD array for all 8760 hours
+TOD_SLOTS = np.array([get_tod_slot(h % 24) for h in range(8760)])
+TOD_LABELS = {"peak": "Peak", "normal": "Normal", "off_peak": "Off-Peak"}
+
+
+# ══════════════════════════════════════════
 #  CORE ENGINE FUNCTIONS
 # ══════════════════════════════════════════
 
@@ -149,76 +173,175 @@ def calculate_capex(solar_mw, wind_mw, elec_mw, storage_t, comp_mw,
 
 def run_dispatch(sp, wp, solar_mw, wind_mw, elec_mw,
                  stack_mw, min_load_pct, eff,
-                 min_flow, max_flow, stor_kg):
-    N            = 8760
-    min_load_mw  = stack_mw * min_load_pct
-    min_flow     = float(min_flow)
-    max_flow     = float(max_flow)
-    stor_kg      = float(stor_kg)
-    stor_level   = stor_kg * 0.5
+                 min_flow, max_flow, stor_kg,
+                 enable_storage=True,
+                 enable_banking=False,
+                 banking_charge_per_kwh=0.5):
+    N           = 8760
+    min_load_mw = stack_mw * min_load_pct
+    min_flow    = float(min_flow)
+    max_flow    = float(max_flow)
+    stor_kg     = float(stor_kg) if enable_storage else 0.0
+    stor_level  = stor_kg   # start full
 
-    re_pw   = np.zeros(N); ep     = np.zeros(N)
-    h2_pr   = np.zeros(N); h2_dl  = np.zeros(N)
-    h2_st   = np.zeros(N); curt   = np.zeros(N)
-    defic   = np.zeros(N); s_draw = np.zeros(N)
+    # Month boundary hours
+    _md = [31,28,31,30,31,30,31,31,30,31,30,31]
+    month_start = []
+    _h = 0
+    for d in _md:
+        month_start.append(_h)
+        _h += d * 24
+    month_start.append(8760)
+    month_of_h = np.zeros(N, dtype=int)
+    for mi in range(12):
+        month_of_h[month_start[mi]:month_start[mi+1]] = mi
+
+    # Banking state — three TOD buckets (kWh)
+    bank_pk = 0.0; bank_nm = 0.0; bank_op = 0.0
+    monthly_re_consumed = np.zeros(12)
+    monthly_banked      = np.zeros(12)
+    monthly_lapsed      = np.zeros(12)
+
+    # Output arrays
+    re_pw   = np.zeros(N); ep      = np.zeros(N)
+    h2_pr   = np.zeros(N); h2_dl   = np.zeros(N)
+    h2_st   = np.zeros(N); curt    = np.zeros(N)
+    defic   = np.zeros(N); s_draw  = np.zeros(N)
     s_chrg  = np.zeros(N)
+    bk_exp  = np.zeros(N); bk_draw = np.zeros(N)
+    bk_bp   = np.zeros(N); bk_bn   = np.zeros(N); bk_bo = np.zeros(N)
+    tod_arr = np.empty(N, dtype=object)
 
     for h in range(N):
+        mi  = int(month_of_h[h])
+        tod = TOD_SLOTS[h]
+        tod_arr[h] = TOD_LABELS[tod]
+
+        # Month boundary — lapse unused banking balance
+        if h > 0 and h in month_start[1:12]:
+            monthly_lapsed[mi-1] = (bank_pk + bank_nm + bank_op) / 1000.0
+            bank_pk = bank_nm = bank_op = 0.0
+
+        # ── Step 1: RE power ──
         re = float(sp[h]) * solar_mw + float(wp[h]) * wind_mw
         re_pw[h] = re
 
+        # ── Step 2: Electrolyzer from RE ──
         if re >= min_load_mw:
-            p         = min(re, elec_mw)
-            ep[h]     = p
-            h2_pr[h]  = p * 1000.0 / eff
-            curt[h]   = max(0.0, re - elec_mw)
+            elec_p    = min(re, elec_mw)
+            ep[h]     = elec_p
+            h2_pr[h]  = elec_p * 1000.0 / eff
+            surplus   = max(0.0, re - elec_mw)
         else:
-            curt[h]   = re
+            surplus   = re   # RE too low — all surplus (elec off)
 
-        # Direct supply capped at max flow
-        direct = min(h2_pr[h], max_flow)
+        monthly_re_consumed[mi] += ep[h]  # MWh
 
-        # Excess beyond max flow goes to storage
-        excess = h2_pr[h] - direct
-        if excess > 0:
+        # ── Step 3: Bank surplus RE ──
+        if enable_banking and surplus > 0:
+            max_can_bank = monthly_re_consumed[mi] * 0.30
+            room         = max(0.0, max_can_bank - monthly_banked[mi])
+            to_bank      = min(surplus, room)   # MWh (1hr)
+            if to_bank > 0:
+                tkwh = to_bank * 1000.0
+                if tod == "peak":
+                    bank_pk += tkwh
+                elif tod == "normal":
+                    bank_nm += tkwh
+                else:
+                    bank_op += tkwh
+                monthly_banked[mi] += to_bank
+                bk_exp[h]           = to_bank
+            curt[h] = surplus - to_bank
+        else:
+            curt[h] = surplus
+
+        # ── Step 4: Direct H2 to consumer ──
+        direct    = min(h2_pr[h], max_flow)
+        excess_h2 = h2_pr[h] - direct
+        if excess_h2 > 0 and enable_storage:
             space       = stor_kg - stor_level
-            charged     = min(excess, space)
+            charged     = min(excess_h2, space)
             stor_level += charged
             s_chrg[h]   = charged
 
-        # If below min flow draw from storage
-        if direct < min_flow:
-            shortfall   = min_flow - direct
-            draw        = min(shortfall, stor_level)
-            direct     += draw
-            stor_level  -= draw
-            s_draw[h]   = draw
+        # ── Step 5: Below min flow → grid banking first ──
+        if direct < min_flow and enable_banking:
+            need_h2  = min_flow - direct
+            need_mwh = need_h2 * eff / 1000.0
+            need_kwh = need_mwh * 1000.0
+            drawn    = 0.0
 
-        # Record deficit if still below min flow after storage draw
+            if tod == "off_peak":
+                d = min(bank_pk, need_kwh - drawn); bank_pk -= d; drawn += d
+                d = min(bank_nm, need_kwh - drawn); bank_nm -= d; drawn += d
+                d = min(bank_op, need_kwh - drawn); bank_op -= d; drawn += d
+            elif tod == "normal":
+                d = min(bank_nm, need_kwh - drawn); bank_nm -= d; drawn += d
+                d = min(bank_op, need_kwh - drawn); bank_op -= d; drawn += d
+            else:  # peak
+                d = min(bank_pk, need_kwh);          bank_pk -= d; drawn  = d
+
+            if drawn > 0:
+                h2_bnk   = min((drawn / 1000.0) * 1000.0 / eff, min_flow - direct)
+                direct  += h2_bnk
+                bk_draw[h] = drawn / 1000.0   # MWh
+
+        # ── Step 6: Still below → H2 storage ──
+        if direct < min_flow and enable_storage:
+            shortfall  = min_flow - direct
+            draw       = min(shortfall, stor_level)
+            direct    += draw
+            stor_level -= draw
+            s_draw[h]  = draw
+
+        # ── Step 7: Deficit ──
         if direct < min_flow:
             defic[h] = min_flow - direct
 
         h2_dl[h] = direct
         h2_st[h] = stor_level
+        bk_bp[h] = bank_pk / 1000.0
+        bk_bn[h] = bank_nm / 1000.0
+        bk_bo[h] = bank_op / 1000.0
+
+    # Lapse last month
+    monthly_lapsed[11] += (bank_pk + bank_nm + bank_op) / 1000.0
 
     sg = float(np.sum(sp * solar_mw))
     wg = float(np.sum(wp * wind_mw))
     rc = float(np.sum(ep))
+    bk_exp_tot  = float(np.sum(bk_exp))
+    bk_draw_tot = float(np.sum(bk_draw))
+    bk_lapse_tot= float(np.sum(monthly_lapsed))
+    bk_charge_cr= bk_draw_tot * banking_charge_per_kwh * 1000.0 / 1e7
 
     return {
-        "re_power":       re_pw,  "elec_power":   ep,
-        "h2_produced":    h2_pr,  "h2_delivered": h2_dl,
-        "h2_storage":     h2_st,  "curtailment":  curt,
-        "deficit":        defic,  "storage_draw": s_draw,
-        "storage_charge": s_chrg,
-        "annual_h2_produced_t":  float(np.sum(h2_pr)) / 1000.0,
-        "annual_h2_delivered_t": float(np.sum(h2_dl)) / 1000.0,
-        "deficit_hours":    int(np.sum(defic > 0)),
-        "storage_draw_hrs": int(np.sum(s_draw > 0)),
-        "elec_util_pct":    float(np.sum(ep > 0)) / N * 100.0,
-        "curtailment_mwh":  float(np.sum(curt)),
-        "solar_gen_mwh": sg, "wind_gen_mwh": wg,
-        "re_self_consump": rc/(sg+wg)*100 if (sg+wg)>0 else 0.0,
+        "re_power":            re_pw,   "elec_power":          ep,
+        "h2_produced":         h2_pr,   "h2_delivered":        h2_dl,
+        "h2_storage":          h2_st,   "curtailment":         curt,
+        "deficit":             defic,   "storage_draw":        s_draw,
+        "storage_charge":      s_chrg,
+        "banking_export":      bk_exp,  "banking_draw":        bk_draw,
+        "banking_bal_peak":    bk_bp,   "banking_bal_normal":  bk_bn,
+        "banking_bal_offpeak": bk_bo,   "tod":                 tod_arr,
+        "monthly_banked":      monthly_banked,
+        "monthly_lapsed":      monthly_lapsed,
+        # Summary
+        "annual_h2_produced_t":       float(np.sum(h2_pr)) / 1000.0,
+        "annual_h2_delivered_t":      float(np.sum(h2_dl)) / 1000.0,
+        "deficit_hours":              int(np.sum(defic > 0)),
+        "storage_draw_hrs":           int(np.sum(s_draw > 0)),
+        "banking_draw_hrs":           int(np.sum(bk_draw > 0)),
+        "elec_util_pct":              float(np.sum(ep > 0)) / N * 100.0,
+        "curtailment_mwh":            float(np.sum(curt)),
+        "solar_gen_mwh":              sg,
+        "wind_gen_mwh":               wg,
+        "re_self_consump":            rc/(sg+wg)*100 if (sg+wg)>0 else 0.0,
+        "total_banking_exported_mwh": bk_exp_tot,
+        "total_banking_drawn_mwh":    bk_draw_tot,
+        "total_banking_lapsed_mwh":   bk_lapse_tot,
+        "banking_charge_cr":          bk_charge_cr,
     }
 
 
@@ -234,6 +357,8 @@ def get_wind_mw(h2_target_t, eff, solar_mw, sp, wp):
 def run_optimization(sp, wp, h2_target_t, min_flow, max_flow,
                      op_hours, stack_mw, eff, min_load_pct, stor_t,
                      cs, cw, ce, cst, cc, bop, epc, cont,
+                     enable_storage=True, enable_banking=False,
+                     banking_charge_per_kwh=0.5,
                      progress_cb=None):
 
     h2_kg    = h2_target_t * 1000.0
@@ -259,7 +384,10 @@ def run_optimization(sp, wp, h2_target_t, min_flow, max_flow,
 
         sim = run_dispatch(sp, wp, solar_mw, wind_mw, elec_mw,
                            stack_mw, min_load_pct, eff,
-                           min_flow, max_flow, stor_kg)
+                           min_flow, max_flow, stor_kg,
+                           enable_storage=enable_storage,
+                           enable_banking=enable_banking,
+                           banking_charge_per_kwh=banking_charge_per_kwh)
 
         if sim["annual_h2_produced_t"] >= h2_target_t * 0.99:
             cap = calculate_capex(solar_mw, wind_mw, elec_mw,
@@ -298,7 +426,10 @@ def run_optimization(sp, wp, h2_target_t, min_flow, max_flow,
                               best_config["solar_mw"], best_config["wind_mw"],
                               best_config["electrolyzer_mw"],
                               stack_mw, min_load_pct, eff,
-                              min_flow, max_flow, stor_kg)
+                              min_flow, max_flow, stor_kg,
+                              enable_storage=enable_storage,
+                              enable_banking=enable_banking,
+                              banking_charge_per_kwh=banking_charge_per_kwh)
 
     final_cap = calculate_capex(best_config["solar_mw"], best_config["wind_mw"],
                                  best_config["electrolyzer_mw"], stor_t, comp_mw,
@@ -381,6 +512,7 @@ with st.sidebar:
 
     st.divider()
     st.markdown('<div class="sidebar-section">🔵 H₂ Storage</div>', unsafe_allow_html=True)
+    enable_storage = st.toggle("Enable H₂ Storage", value=True)
     storage_t_input = st.number_input(
         "Storage Capacity (tH₂)",
         min_value=1.0, max_value=10000.0, value=100.0, step=10.0,
@@ -391,6 +523,26 @@ with st.sidebar:
     = {storage_t_input*1000:.0f} kg<br>
     ≈ {storage_t_input/(avg_flow*24/1000):.1f} days of avg demand
     </div>""", unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown('<div class="sidebar-section">⚡ Grid Banking (AP Reg. 2024)</div>', unsafe_allow_html=True)
+    enable_banking = st.toggle("Enable Grid Banking", value=False)
+    if enable_banking:
+        banking_charge = st.number_input(
+            "Banking Charge (₹/kWh)", min_value=0.0,
+            max_value=5.0, value=0.50, step=0.05, format="%.2f",
+            help="Charge paid to DISCOM per kWh drawn from banking"
+        )
+        st.markdown("""<div class="derived-box">
+        TOD Slots (AP 2024):<br>
+        Off-Peak : 09:00 – 17:00<br>
+        Peak     : 05:00–09:00 &amp; 19:00–23:00<br>
+        Normal   : 23:00–05:00 &amp; 17:00–19:00<br><br>
+        Monthly banking limit = 30% of RE consumed<br>
+        Unused balance lapses at month end
+        </div>""", unsafe_allow_html=True)
+    else:
+        banking_charge = 0.5
 
     st.divider()
     st.markdown('<div class="sidebar-section">₹ Unit Costs (Crores)</div>', unsafe_allow_html=True)
@@ -472,6 +624,9 @@ if run_btn:
                 cs=float(cost_solar), cw=float(cost_wind), ce=float(cost_elec),
                 cst=float(cost_stor), cc=float(cost_comp),
                 bop=float(bop_pct), epc=float(epc_pct), cont=float(cont_pct),
+                enable_storage=enable_storage,
+                enable_banking=enable_banking,
+                banking_charge_per_kwh=float(banking_charge),
                 progress_cb=pcb,
             )
             res["sp"] = sp_arr; res["wp"] = wp_arr
@@ -480,6 +635,9 @@ if run_btn:
                 op_days=op_days, hrs_per_day=hrs_per_day, op_hours=op_hours,
                 stack_mw=stack_mw, efficiency=efficiency,
                 storage_t=storage_t_input,
+                enable_storage=enable_storage,
+                enable_banking=enable_banking,
+                banking_charge=banking_charge,
             )
             st.session_state.results = res
 
@@ -591,6 +749,61 @@ with tab1:
               "Hours storage supplied consumer")
     k5.metric("Elec. Util.",     f"{sim['elec_util_pct']:.1f}%")
     k6.metric("Curtailment",     f"{sim['curtailment_mwh']:,.0f} MWh")
+
+    # Banking KPIs — only show if enabled
+    if inp.get("enable_banking"):
+        st.divider()
+        st.markdown("#### ⚡ Grid Banking Summary (AP Reg. 2024)")
+        b1,b2,b3,b4,b5,b6 = st.columns(6)
+        b1.metric("Banking Exported", f"{sim.get('total_banking_exported_mwh',0):,.0f} MWh/yr",
+                  "Surplus RE banked")
+        b2.metric("Banking Drawn",    f"{sim.get('total_banking_drawn_mwh',0):,.0f} MWh/yr",
+                  "Grid power drawn back")
+        b3.metric("Banking Lapsed",   f"{sim.get('total_banking_lapsed_mwh',0):,.0f} MWh/yr",
+                  "Unused at month end")
+        b4.metric("Banking Draw Hrs", f"{sim.get('banking_draw_hrs',0)} hrs/yr")
+        b5.metric("Banking Charge",   f"₹ {sim.get('banking_charge_cr',0):.3f} Cr/yr",
+                  f"@ ₹ {inp.get('banking_charge',0.5)}/kWh")
+        b6.metric("Storage Toggle",
+                  "ON" if inp.get("enable_storage") else "OFF",
+                  "H₂ Storage status")
+
+        # Monthly banking chart
+        mon_exp  = []
+        mon_draw = []
+        mon_lap  = []
+        h = 0
+        for mi, days in enumerate([31,28,31,30,31,30,31,31,30,31,30,31]):
+            hrs = days*24
+            mon_exp.append(float(np.sum(sim["banking_export"][h:h+hrs])))
+            mon_draw.append(float(np.sum(sim["banking_draw"][h:h+hrs])))
+            mon_lap.append(float(sim["monthly_lapsed"][mi]))
+            h += hrs
+
+        fig_bk = go.Figure()
+        fig_bk.add_trace(go.Bar(name="Exported (MWh)", x=MONTHS, y=mon_exp,
+                                 marker_color=C["solar"], opacity=0.8))
+        fig_bk.add_trace(go.Bar(name="Drawn (MWh)",    x=MONTHS, y=mon_draw,
+                                 marker_color=C["wind"],  opacity=0.8))
+        fig_bk.add_trace(go.Bar(name="Lapsed (MWh)",   x=MONTHS, y=mon_lap,
+                                 marker_color=C["demand"],opacity=0.7))
+        fig_bk.update_layout(**PL, barmode="group", height=300,
+                              title="Monthly Banking — Export vs Draw vs Lapsed (MWh)",
+                              yaxis_title="MWh")
+        st.plotly_chart(fig_bk, use_container_width=True)
+
+        # TOD breakdown
+        st.markdown("**TOD Slot Analysis**")
+        td1, td2, td3 = st.columns(3)
+        peak_exp  = float(np.sum(sim["banking_export"][TOD_SLOTS=="peak"]))
+        norm_exp  = float(np.sum(sim["banking_export"][TOD_SLOTS=="normal"]))
+        op_exp    = float(np.sum(sim["banking_export"][TOD_SLOTS=="off_peak"]))
+        peak_draw = float(np.sum(sim["banking_draw"][TOD_SLOTS=="peak"]))
+        norm_draw = float(np.sum(sim["banking_draw"][TOD_SLOTS=="normal"]))
+        op_draw   = float(np.sum(sim["banking_draw"][TOD_SLOTS=="off_peak"]))
+        td1.metric("Peak Export / Draw",     f"{peak_exp:.0f} / {peak_draw:.0f} MWh")
+        td2.metric("Normal Export / Draw",   f"{norm_exp:.0f} / {norm_draw:.0f} MWh")
+        td3.metric("Off-Peak Export / Draw", f"{op_exp:.0f} / {op_draw:.0f} MWh")
 
     st.divider()
     st.markdown("#### ✓ Constraint Checks")
@@ -942,21 +1155,27 @@ with tab5:
         total_gen_hr = np.round(solar_gen_hr + wind_gen_hr, 2)
 
         dd = pd.DataFrame({
-            "Hour":              np.arange(8760),
-            "Month":             month_col,
-            "Day":               day_col,
-            "Hour_of_Day":       hour_col,
-            "Solar_Gen_MW":      solar_gen_hr,
-            "Wind_Gen_MW":       wind_gen_hr,
-            "Total_RE_Gen_MW":   total_gen_hr,
-            "Elec_Power_MW":     np.round(sim["elec_power"],     2),
-            "H2_Produced_kg":    np.round(sim["h2_produced"],    1),
-            "H2_Delivered_kg":   np.round(sim["h2_delivered"],   1),
-            "Storage_Draw_kg":   np.round(sim["storage_draw"],   1),
-            "Storage_Charge_kg": np.round(sim["storage_charge"], 1),
-            "H2_Storage_kg":     np.round(sim["h2_storage"],     1),
-            "Curtailment_MW":    np.round(sim["curtailment"],     2),
-            "Deficit_kg":        np.round(sim["deficit"],         1),
+            "Hour":                  np.arange(8760),
+            "Month":                 month_col,
+            "Day":                   day_col,
+            "Hour_of_Day":           hour_col,
+            "TOD_Slot":              sim.get("tod", ["—"]*8760),
+            "Solar_Gen_MW":          solar_gen_hr,
+            "Wind_Gen_MW":           wind_gen_hr,
+            "Total_RE_Gen_MW":       total_gen_hr,
+            "Elec_Power_MW":         np.round(sim["elec_power"],         2),
+            "H2_Produced_kg":        np.round(sim["h2_produced"],        1),
+            "H2_Delivered_kg":       np.round(sim["h2_delivered"],       1),
+            "Storage_Draw_kg":       np.round(sim["storage_draw"],       1),
+            "Storage_Charge_kg":     np.round(sim["storage_charge"],     1),
+            "H2_Storage_kg":         np.round(sim["h2_storage"],         1),
+            "Banking_Export_MWh":    np.round(sim.get("banking_export",  np.zeros(8760)), 3),
+            "Banking_Draw_MWh":      np.round(sim.get("banking_draw",    np.zeros(8760)), 3),
+            "Banking_Bal_Peak_MWh":  np.round(sim.get("banking_bal_peak",np.zeros(8760)), 3),
+            "Banking_Bal_Norm_MWh":  np.round(sim.get("banking_bal_normal",np.zeros(8760)), 3),
+            "Banking_Bal_OP_MWh":    np.round(sim.get("banking_bal_offpeak",np.zeros(8760)), 3),
+            "Curtailment_MW":        np.round(sim["curtailment"],         2),
+            "Deficit_kg":            np.round(sim["deficit"],             1),
         })
         st.download_button("⬇ Download Hourly Dispatch (CSV)",
                             dd.to_csv(index=False),
@@ -987,21 +1206,27 @@ with tab6:
     total_gen_hd = np.round(solar_gen_hd + wind_gen_hd, 2)
 
     hourly_df = pd.DataFrame({
-        "Hour":              np.arange(8760),
-        "Month":             month_col_hd,
-        "Day":               day_col_hd,
-        "Hour_of_Day":       hour_col_hd,
-        "Solar_Gen_MW":      solar_gen_hd,
-        "Wind_Gen_MW":       wind_gen_hd,
-        "Total_RE_Gen_MW":   total_gen_hd,
-        "Elec_Power_MW":     np.round(sim["elec_power"],     2),
-        "H2_Produced_kg":    np.round(sim["h2_produced"],    1),
-        "H2_Delivered_kg":   np.round(sim["h2_delivered"],   1),
-        "Storage_Draw_kg":   np.round(sim["storage_draw"],   1),
-        "Storage_Charge_kg": np.round(sim["storage_charge"], 1),
-        "H2_Storage_kg":     np.round(sim["h2_storage"],     1),
-        "Curtailment_MW":    np.round(sim["curtailment"],     2),
-        "Deficit_kg":        np.round(sim["deficit"],         1),
+        "Hour":                  np.arange(8760),
+        "Month":                 month_col_hd,
+        "Day":                   day_col_hd,
+        "Hour_of_Day":           hour_col_hd,
+        "TOD_Slot":              sim.get("tod", ["—"]*8760),
+        "Solar_Gen_MW":          solar_gen_hd,
+        "Wind_Gen_MW":           wind_gen_hd,
+        "Total_RE_Gen_MW":       total_gen_hd,
+        "Elec_Power_MW":         np.round(sim["elec_power"],          2),
+        "H2_Produced_kg":        np.round(sim["h2_produced"],         1),
+        "H2_Delivered_kg":       np.round(sim["h2_delivered"],        1),
+        "Storage_Draw_kg":       np.round(sim["storage_draw"],        1),
+        "Storage_Charge_kg":     np.round(sim["storage_charge"],      1),
+        "H2_Storage_kg":         np.round(sim["h2_storage"],          1),
+        "Banking_Export_MWh":    np.round(sim.get("banking_export",   np.zeros(8760)), 3),
+        "Banking_Draw_MWh":      np.round(sim.get("banking_draw",     np.zeros(8760)), 3),
+        "Banking_Bal_Peak_MWh":  np.round(sim.get("banking_bal_peak", np.zeros(8760)), 3),
+        "Banking_Bal_Norm_MWh":  np.round(sim.get("banking_bal_normal",np.zeros(8760)),3),
+        "Banking_Bal_OP_MWh":    np.round(sim.get("banking_bal_offpeak",np.zeros(8760)),3),
+        "Curtailment_MW":        np.round(sim["curtailment"],          2),
+        "Deficit_kg":            np.round(sim["deficit"],              1),
     })
 
     # ── Filter controls ──
@@ -1027,6 +1252,8 @@ with tab6:
             options=[
                 "All Hours",
                 "Storage Drawing Hours",
+                "Banking Draw Hours",
+                "Banking Export Hours",
                 "Deficit Hours",
                 "Curtailment Hours",
                 "Zero Production Hours",
@@ -1043,6 +1270,10 @@ with tab6:
 
     if show_filter == "Storage Drawing Hours":
         filtered = filtered[filtered["Storage_Draw_kg"] > 0]
+    elif show_filter == "Banking Draw Hours":
+        filtered = filtered[filtered["Banking_Draw_MWh"] > 0]
+    elif show_filter == "Banking Export Hours":
+        filtered = filtered[filtered["Banking_Export_MWh"] > 0]
     elif show_filter == "Deficit Hours":
         filtered = filtered[filtered["Deficit_kg"] > 0]
     elif show_filter == "Curtailment Hours":
@@ -1066,10 +1297,12 @@ with tab6:
 
     # ── Column selector ──
     all_cols = hourly_df.columns.tolist()
-    default_cols = ["Hour","Month","Day","Hour_of_Day",
+    default_cols = ["Hour","Month","Day","Hour_of_Day","TOD_Slot",
                     "Solar_Gen_MW","Wind_Gen_MW","Total_RE_Gen_MW",
                     "Elec_Power_MW","H2_Produced_kg","H2_Delivered_kg",
-                    "Storage_Draw_kg","H2_Storage_kg","Deficit_kg"]
+                    "Storage_Draw_kg","H2_Storage_kg",
+                    "Banking_Export_MWh","Banking_Draw_MWh",
+                    "Banking_Bal_Peak_MWh","Deficit_kg"]
 
     selected_cols = st.multiselect(
         "Select Columns to Display",
