@@ -465,6 +465,16 @@ with st.sidebar:
     st.caption("Green Hydrogen Plant Sizing · v2.0")
     st.divider()
 
+    # ── Mode Toggle ──
+    mode = st.radio(
+        "**Mode**",
+        options=["🔍 Optimise CAPEX", "✏️ Manual Entry"],
+        horizontal=True,
+        help="Optimise: finds minimum CAPEX automatically. Manual: you define all capacities."
+    )
+    is_manual = (mode == "✏️ Manual Entry")
+    st.divider()
+
     st.markdown('<div class="sidebar-section">☀ RE Profiles</div>', unsafe_allow_html=True)
     st.caption("8760 rows · single column · capacity factor (0 to 1)")
     solar_file = st.file_uploader("Solar Profile CSV", type=["csv"], key="solar")
@@ -503,12 +513,34 @@ with st.sidebar:
     min_elec_calc    = h2_annual * 1000 * efficiency / (op_hours * 1000) if op_hours > 0 else 0
     min_elec_rounded = np.ceil(min_elec_calc / stack_mw) * stack_mw if stack_mw > 0 else 0
 
-    st.markdown(f"""<div class="derived-box">
-    Min Elec (calc)    = {min_elec_calc:.1f} MW<br>
-    Min Elec (rounded) = {min_elec_rounded:.0f} MW<br>
-    = {int(min_elec_rounded/stack_mw) if stack_mw>0 else 0} × {stack_mw} MW stacks<br>
-    Sweep starts here ↑
-    </div>""", unsafe_allow_html=True)
+    if not is_manual:
+        st.markdown(f"""<div class="derived-box">
+        Min Elec (calc)    = {min_elec_calc:.1f} MW<br>
+        Min Elec (rounded) = {min_elec_rounded:.0f} MW<br>
+        = {int(min_elec_rounded/stack_mw) if stack_mw>0 else 0} × {stack_mw} MW stacks<br>
+        Sweep starts here ↑
+        </div>""", unsafe_allow_html=True)
+
+    # ── Manual capacity inputs (only shown in manual mode) ──
+    if is_manual:
+        st.divider()
+        st.markdown('<div class="sidebar-section">📐 Manual Capacities</div>', unsafe_allow_html=True)
+        st.caption("Define all plant capacities directly")
+        ma1, ma2 = st.columns(2)
+        with ma1: manual_solar = st.number_input("Solar (MWp)",       min_value=1.0, value=float(max(min_elec_rounded,65)), step=5.0)
+        with ma2: manual_wind  = st.number_input("Wind (MW)",         min_value=1.0, value=float(max(min_elec_rounded*0.5,33)), step=5.0)
+        ma3, ma4 = st.columns(2)
+        with ma3: manual_elec  = st.number_input("Electrolyzer (MW)", min_value=1.0, value=float(min_elec_rounded), step=5.0)
+        with ma4: manual_comp  = st.number_input("Compressor (MW)",   min_value=0.1, value=max(1.0, round(max_flow/1000*0.055,1)), step=0.5)
+
+        # Show what the manual config means
+        h2_cap_kg = manual_elec * 1000.0 / efficiency
+        st.markdown(f"""<div class="derived-box">
+        H₂ capacity = {h2_cap_kg:.0f} kg/hr<br>
+        vs Max Flow  = {max_flow} kg/hr {"✅" if h2_cap_kg >= max_flow else "⚠ Below max flow"}<br>
+        Solar/Elec ratio = {manual_solar/manual_elec:.2f} {"✅" if abs(manual_solar/manual_elec-1)<0.1 else "≠ 1.0"}<br>
+        Wind/Solar ratio = {manual_wind/manual_solar:.2f} {"✅" if manual_wind/manual_solar>=0.5 else "⚠ Below 50% floor"}
+        </div>""", unsafe_allow_html=True)
 
     st.divider()
     st.markdown('<div class="sidebar-section">🔵 H₂ Storage</div>', unsafe_allow_html=True)
@@ -559,7 +591,10 @@ with st.sidebar:
     with cc: cont_pct = st.number_input("Cont%", value=5,  step=1) / 100.0
 
     st.divider()
-    run_btn = st.button("▶  OPTIMISE CAPEX", use_container_width=True)
+    if is_manual:
+        run_btn = st.button("▶  RUN SIMULATION", use_container_width=True)
+    else:
+        run_btn = st.button("▶  OPTIMISE CAPEX", use_container_width=True)
 
 
 # ─────────────────────────────────────────────
@@ -597,57 +632,126 @@ if run_btn:
     wp_arr = load_profile(wind_file,  "Wind")
     if sp_arr is None or wp_arr is None: st.stop()
 
-    prog = st.progress(0.0)
-    stat = st.empty()
-    logc = st.empty()
-    logs = []
+    # ── MANUAL MODE ──────────────────────────────────────────
+    if is_manual:
+        try:
+            with st.spinner("Running simulation with manual capacities..."):
+                stor_kg   = float(storage_t_input) * 1000.0
+                comp_mw   = float(manual_comp)
+                stor_t    = float(storage_t_input)
 
-    def pcb(step, elec_mw, wind_mw, capex_cr, h2_t):
-        prog.progress(min(step/150, 1.0))
-        stat.markdown(
-            f"**Step {step}** | Elec = **{elec_mw:.0f} MW** | "
-            f"Solar = **{elec_mw:.0f} MWp** | Wind = **{wind_mw:.0f} MW** | "
-            f"H₂ = {h2_t:.0f} t | CAPEX = ₹ {capex_cr:.1f} Cr"
-        )
-        logs.append(f"[{step:>3}] Elec={elec_mw:.0f} Solar={elec_mw:.0f} "
-                    f"Wind={wind_mw:.0f} H2={h2_t:.0f}t → ₹{capex_cr:.2f}Cr")
-        logc.code("\n".join(logs[-10:]), language="")
+                final_sim = run_dispatch(
+                    sp=sp_arr, wp=wp_arr,
+                    solar_mw=float(manual_solar),
+                    wind_mw=float(manual_wind),
+                    elec_mw=float(manual_elec),
+                    stack_mw=float(stack_mw),
+                    min_load_pct=float(min_load_pct),
+                    eff=float(efficiency),
+                    min_flow=float(min_flow),
+                    max_flow=float(max_flow),
+                    stor_kg=stor_kg,
+                    enable_storage=enable_storage,
+                    enable_banking=enable_banking,
+                    banking_charge_per_kwh=float(banking_charge),
+                )
 
-    try:
-        with st.spinner("Running optimization..."):
-            res = run_optimization(
-                sp=sp_arr, wp=wp_arr,
-                h2_target_t=h2_annual, min_flow=float(min_flow),
-                max_flow=float(max_flow), op_hours=float(op_hours),
-                stack_mw=float(stack_mw), eff=float(efficiency),
-                min_load_pct=float(min_load_pct), stor_t=float(storage_t_input),
-                cs=float(cost_solar), cw=float(cost_wind), ce=float(cost_elec),
-                cst=float(cost_stor), cc=float(cost_comp),
-                bop=float(bop_pct), epc=float(epc_pct), cont=float(cont_pct),
-                enable_storage=enable_storage,
-                enable_banking=enable_banking,
-                banking_charge_per_kwh=float(banking_charge),
-                progress_cb=pcb,
+                final_cap = calculate_capex(
+                    float(manual_solar), float(manual_wind),
+                    float(manual_elec), stor_t, comp_mw,
+                    float(cost_solar), float(cost_wind), float(cost_elec),
+                    float(cost_stor), float(cost_comp),
+                    float(bop_pct), float(epc_pct), float(cont_pct),
+                )
+
+                res = dict(
+                    best_config=dict(
+                        electrolyzer_mw=float(manual_elec),
+                        solar_mw=float(manual_solar),
+                        wind_mw=float(manual_wind),
+                        storage_t=stor_t,
+                        compressor_mw=comp_mw,
+                    ),
+                    final_capex=final_cap,
+                    final_sim=final_sim,
+                    sweep=[],             # no sweep in manual mode
+                    min_elec_mw=float(manual_elec),
+                    storage_t=stor_t,
+                    avg_flow=avg_flow,
+                    sp=sp_arr, wp=wp_arr,
+                    mode="manual",
+                    inp=dict(
+                        h2_annual=h2_annual, min_flow=min_flow,
+                        max_flow=max_flow, op_days=op_days,
+                        hrs_per_day=hrs_per_day, op_hours=op_hours,
+                        stack_mw=stack_mw, efficiency=efficiency,
+                        storage_t=storage_t_input,
+                        enable_storage=enable_storage,
+                        enable_banking=enable_banking,
+                        banking_charge=banking_charge,
+                    ),
+                )
+                st.session_state.results = res
+            st.success("✅ Simulation Complete!")
+
+        except Exception as e:
+            st.error(f"Simulation failed: {e}")
+            st.stop()
+
+    # ── OPTIMISE MODE ─────────────────────────────────────────
+    else:
+        prog = st.progress(0.0)
+        stat = st.empty()
+        logc = st.empty()
+        logs = []
+
+        def pcb(step, elec_mw, wind_mw, capex_cr, h2_t):
+            prog.progress(min(step/150, 1.0))
+            stat.markdown(
+                f"**Step {step}** | Elec = **{elec_mw:.0f} MW** | "
+                f"Solar = **{elec_mw:.0f} MWp** | Wind = **{wind_mw:.0f} MW** | "
+                f"H₂ = {h2_t:.0f} t | CAPEX = ₹ {capex_cr:.1f} Cr"
             )
-            res["sp"] = sp_arr; res["wp"] = wp_arr
-            res["inp"] = dict(
-                h2_annual=h2_annual, min_flow=min_flow, max_flow=max_flow,
-                op_days=op_days, hrs_per_day=hrs_per_day, op_hours=op_hours,
-                stack_mw=stack_mw, efficiency=efficiency,
-                storage_t=storage_t_input,
-                enable_storage=enable_storage,
-                enable_banking=enable_banking,
-                banking_charge=banking_charge,
-            )
-            st.session_state.results = res
+            logs.append(f"[{step:>3}] Elec={elec_mw:.0f} Solar={elec_mw:.0f} "
+                        f"Wind={wind_mw:.0f} H2={h2_t:.0f}t → ₹{capex_cr:.2f}Cr")
+            logc.code("\n".join(logs[-10:]), language="")
 
-        prog.progress(1.0)
-        stat.success("✅ Optimization Complete — Minimum CAPEX Found!")
-        logc.empty()
+        try:
+            with st.spinner("Running optimization..."):
+                res = run_optimization(
+                    sp=sp_arr, wp=wp_arr,
+                    h2_target_t=h2_annual, min_flow=float(min_flow),
+                    max_flow=float(max_flow), op_hours=float(op_hours),
+                    stack_mw=float(stack_mw), eff=float(efficiency),
+                    min_load_pct=float(min_load_pct), stor_t=float(storage_t_input),
+                    cs=float(cost_solar), cw=float(cost_wind), ce=float(cost_elec),
+                    cst=float(cost_stor), cc=float(cost_comp),
+                    bop=float(bop_pct), epc=float(epc_pct), cont=float(cont_pct),
+                    enable_storage=enable_storage,
+                    enable_banking=enable_banking,
+                    banking_charge_per_kwh=float(banking_charge),
+                    progress_cb=pcb,
+                )
+                res["sp"] = sp_arr; res["wp"] = wp_arr
+                res["mode"] = "optimise"
+                res["inp"] = dict(
+                    h2_annual=h2_annual, min_flow=min_flow, max_flow=max_flow,
+                    op_days=op_days, hrs_per_day=hrs_per_day, op_hours=op_hours,
+                    stack_mw=stack_mw, efficiency=efficiency,
+                    storage_t=storage_t_input,
+                    enable_storage=enable_storage,
+                    enable_banking=enable_banking,
+                    banking_charge=banking_charge,
+                )
+                st.session_state.results = res
 
-    except Exception as e:
-        st.error(f"Optimization failed: {e}")
-        st.stop()
+            prog.progress(1.0)
+            stat.success("✅ Optimization Complete — Minimum CAPEX Found!")
+            logc.empty()
+
+        except Exception as e:
+            st.error(f"Optimization failed: {e}")
+            st.stop()
 
 
 # ─────────────────────────────────────────────
@@ -697,10 +801,12 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 # ════════════════════════════════
 with tab1:
 
+    mode_label = "MANUAL SIMULATION" if res.get("mode")=="manual" else "OPTIMISED MINIMUM CAPEX"
+    mode_color = "#2a5a7a" if res.get("mode")=="manual" else "#8a6800"
     st.markdown(f"""
     <div class="capex-banner">
-      <div style="font-size:11px;color:#8a6800;letter-spacing:3px;font-weight:700;">
-        MINIMUM PROJECT CAPEX
+      <div style="font-size:11px;color:{mode_color};letter-spacing:3px;font-weight:700;">
+        {mode_label}
       </div>
       <div style="font-size:44px;font-weight:800;color:#c89a00;font-family:monospace;margin:6px 0;">
         ₹ {cap['total_cr']:,.2f}
@@ -714,19 +820,27 @@ with tab1:
     """, unsafe_allow_html=True)
 
     # Sizing logic trace
-    st.markdown("#### 🔢 How the Electrolyzer Was Sized")
-    avg_f = inp["h2_annual"] * 1000 / inp["op_hours"]
+    avg_f  = inp["h2_annual"] * 1000 / inp["op_hours"]
     m_elec = inp["h2_annual"] * 1000 * inp["efficiency"] / (inp["op_hours"] * 1000)
 
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Avg H₂ Flow",       f"{avg_f:.0f} kg/hr",
-              f"{inp['h2_annual']:,}t ÷ {inp['op_hours']:,}h")
-    s2.metric("Min Elec (calc)",    f"{m_elec:.1f} MW",
-              f"Avg Flow × {inp['efficiency']} ÷ 1000")
-    s3.metric("Min Elec (rounded)", f"{res['min_elec_mw']:.0f} MW",
-              f"⌈{m_elec:.1f} ÷ {inp['stack_mw']}⌉ × {inp['stack_mw']}")
-    s4.metric("Optimal (min CAPEX)",f"{cfg['electrolyzer_mw']:.0f} MW",
-              "After CAPEX sweep ↓")
+    if res.get("mode") == "manual":
+        st.markdown("#### 📐 Manual Capacities Entered")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Avg H₂ Flow",    f"{avg_f:.0f} kg/hr")
+        s2.metric("Solar Entered",  f"{cfg['solar_mw']:.0f} MWp")
+        s3.metric("Wind Entered",   f"{cfg['wind_mw']:.0f} MW")
+        s4.metric("Electrolyzer",   f"{cfg['electrolyzer_mw']:.0f} MW")
+    else:
+        st.markdown("#### 🔢 How the Electrolyzer Was Sized")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Avg H₂ Flow",       f"{avg_f:.0f} kg/hr",
+                  f"{inp['h2_annual']:,}t ÷ {inp['op_hours']:,}h")
+        s2.metric("Min Elec (calc)",    f"{m_elec:.1f} MW",
+                  f"Avg Flow × {inp['efficiency']} ÷ 1000")
+        s3.metric("Min Elec (rounded)", f"{res['min_elec_mw']:.0f} MW",
+                  f"⌈{m_elec:.1f} ÷ {inp['stack_mw']}⌉ × {inp['stack_mw']}")
+        s4.metric("Optimal (min CAPEX)",f"{cfg['electrolyzer_mw']:.0f} MW",
+                  "After CAPEX sweep ↓")
 
     st.divider()
     st.markdown("#### ⚙ Optimized Capacities")
@@ -1015,7 +1129,12 @@ with tab3:
 with tab4:
     st.markdown("#### 📈 CAPEX vs Electrolyzer MW — Inflection Point")
 
-    if len(sweep) > 1:
+    if res.get("mode") == "manual":
+        st.info(
+            "ℹ️ Optimization Curve is not available in Manual Entry mode. "
+            "Switch to **🔍 Optimise CAPEX** mode to see the CAPEX sweep curve."
+        )
+    elif len(sweep) > 1:
         sw  = pd.DataFrame(sweep)
         opt = sw.loc[sw["total_capex_cr"].idxmin()]
 
